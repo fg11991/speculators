@@ -34,15 +34,16 @@ from speculators.train.distributed import (
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.utils import normalize_counted_metrics
+from speculators.utils.util import synchronize
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 
 class _StepTimer:
-    # Each mark()/now() forces a cuda.synchronize to capture true GPU time.
-    # This serialises the CUDA pipeline, so profiled steps are slower; keep
-    # log_freq > 1 in perf-sensitive runs.
+    # Each mark()/now() forces an accelerator synchronize (cuda, npu, ...) to
+    # capture true device time. This serialises the device pipeline, so profiled
+    # steps are slower; keep log_freq > 1 in perf-sensitive runs.
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
         self._marks: dict[str, float] = {}
@@ -53,7 +54,7 @@ class _StepTimer:
 
     def mark(self, name: str) -> None:
         if self.enabled:
-            torch.cuda.synchronize()
+            synchronize()
             self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
@@ -63,7 +64,7 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        torch.cuda.synchronize()
+        synchronize()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:

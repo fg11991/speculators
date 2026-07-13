@@ -41,6 +41,7 @@ from speculators.train.vocab_mapping import (
 )
 from speculators.utils.argparse_utils import explicitly_provided_dests
 from speculators.utils.loading import is_config_only_dir
+from speculators.utils.util import empty_cache, is_npu_available, manual_seed_all
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
     np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    manual_seed_all(seed)
 
     if deterministic:
         # For deterministic behavior (may impact performance)
@@ -452,6 +453,18 @@ def main(args: argparse.Namespace):  # noqa: C901
         )
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
 
+    # Flex attention requires the inductor backend, which Ascend NPU lacks.
+    if (
+        args.speculator_type != "mtp"
+        and args.draft_attn_impl == "simple_flex_attention"
+        and is_npu_available()
+    ):
+        logger.warning(
+            "simple_flex_attention is unavailable on Ascend NPU; "
+            "falling back to --draft-attn-impl sdpa."
+        )
+        args.draft_attn_impl = "sdpa"
+
     if args.speculator_type == "mtp":
         if args.draft_attn_impl != "simple_flex_attention":
             raise ValueError(
@@ -586,8 +599,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     # Cleanup
     del trainer, draft_model
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    empty_cache()
     maybe_destroy_distributed()
 
 
