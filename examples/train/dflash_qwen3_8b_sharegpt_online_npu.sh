@@ -80,6 +80,9 @@ done
 echo "vLLM server ready."
 
 # Step 3: Train against the live vLLM server
+# Multi-card training defaults to DDP (fp32 replicated master weights); the
+# draft model is small enough to fit per card. Add --fsdp-shard only if it
+# does not.
 echo "=== Step 3: Training ==="
 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \

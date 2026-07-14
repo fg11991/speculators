@@ -1,6 +1,7 @@
 # speculators NPU(Ascend 910B/910C)适配计划书
 
-> 更新:2026-07-13,基于 main(`6030a44`)调研,工作分支 `npu-support`
+> 更新:2026-07-14,基于 main(`6030a44`)调研,工作分支 `npu-support`
+> 2026-07-14 增量:按《glm5.2_adaptation.md》L1 清单,本地合入上游 open PR #755、#711,新增 norm canary 脚本(见 §3 第 5~7 条)
 
 ## 1. 背景与目标
 
@@ -27,6 +28,9 @@
    - `set_seed` 的 `torch.cuda.manual_seed_all` → 通用 `manual_seed_all`(NPU 上也能正确播种);
    - 收尾的 `torch.cuda.empty_cache()` → 通用 `empty_cache()`。
 4. **`examples/train/dflash_qwen3_8b_sharegpt_online_npu.sh`**:910B 版示例(`ASCEND_RT_VISIBLE_DEVICES`、显式 `--draft-attn-impl sdpa`、adamw 回退开关)。
+5. **合入 #755(open,LGTM×2)**:`--from-pretrained` 加载路径重新应用 `--draft-attn-impl`(HF config 不序列化 `_attn_implementation`,原先静默回落默认实现——CUDA 上不可见,NPU 上直接崩)。续训工作流(基于开源 draft 续训)必需。
+6. **合入 #711(open,维护者 AMP 重构)**:修复 FSDP2 混合精度静默失效(分片前整体转 bf16 + 根节点漏传 `mp_policy` → 无 fp32 主权重,norm/fc/markov/confidence 头的更新被 bf16 舍入吞没、AdamW 权重衰减全体丢失,GLM-5.2 实测修复带来 +13.5%~28.9% accept_len)。现在:fp32 主权重 + `torch.autocast` 前向;**多卡默认改为 DDP**,模型放不下单卡时加 `--fsdp-shard`;checkpoint config.json dtype 与磁盘实际 dtype 对齐;float16 被显式拒绝。
+7. **`scripts/check_norm_canary.py`**:混合精度缺陷零成本判据——扫描已训 checkpoint 的 norm 张量,`max|w-1| == 0` 即命中缺陷(需重训)。**对已有全部 DFlash/DSpark checkpoint 跑一遍。**
 
 ## 4. 910B Qwen3-8B 试验步骤
 
@@ -53,6 +57,9 @@
 
 | 项 | 状态 | 说明 |
 |---|---|---|
+| FSDP2 混合精度静默失效 | ✅ 已修 | #711 本地合入;老 checkpoint 用 `scripts/check_norm_canary.py` 排查 |
+| `--from-pretrained` 丢注意力后端 | ✅ 已修 | #755 本地合入 |
+| 上游 #755/#711 正式合入后 | ⚠️ 记得处理 | rebase 时丢弃本地对应提交(`758c65c`/`c463a47`),以上游版本为准 |
 | vllm-ascend extract_hidden_states | ❓ 待验证 | 最大外部依赖,第 4.2 步先探测 |
 | sdpa 稠密 mask 在 CANN 上的算子覆盖 | ❓ 待验证 | 失败则用 eager |
 | muon on NPU | ❓ 待验证 | 失败回退 adamw |
