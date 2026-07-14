@@ -35,6 +35,7 @@
 ## 4. 910B Qwen3-8B 试验步骤
 
 1. 环境:torch + 配套 torch_npu、CANN;serve 侧 vllm + vllm-ascend(可以与训练分开 venv,`launch_vllm.py` 会 re-exec 当前解释器,同 venv 时注意)。
+   **推荐镜像(2026-07 调研)**:`quay.io/ascend/vllm-ascend:v0.22.1rc1`(910B/A2;910C/A3 用 `v0.22.1rc1-a3`),内含 vLLM 0.22.1、torch 2.10.0、torch_npu 2.10.0、CANN 9.0.0(NNAL 9.0.0)、Python 3.12。**下限 v0.20.2rc1**(extract_hidden_states 昇腾实现自此进入)。训练容器可直接复用同一镜像(torch 2.10.0 满足 speculators 的 `torch>=2.9,<=2.12.1`),再源码装 npu-support 分支;宿主机驱动按 CANN 9.0.0 兼容表核对。
 2. **先做 vllm-ascend 能力探测**(整条链路的最大外部依赖):
    ```bash
    python scripts/launch_vllm.py Qwen/Qwen3-8B --target-layer-ids 2 18 33 -- --port 8000
@@ -60,7 +61,7 @@
 | FSDP2 混合精度静默失效 | ✅ 已修 | #711 本地合入;老 checkpoint 用 `scripts/check_norm_canary.py` 排查 |
 | `--from-pretrained` 丢注意力后端 | ✅ 已修 | #755 本地合入 |
 | 上游 #755/#711 正式合入后 | ⚠️ 记得处理 | rebase 时丢弃本地对应提交(`758c65c`/`c463a47`),以上游版本为准 |
-| vllm-ascend extract_hidden_states | ❓ 待验证 | 最大外部依赖,第 4.2 步先探测 |
+| vllm-ascend extract_hidden_states | ✅ 文档级确认 | vllm-ascend 自 **v0.20.2rc1** 起内置 `AscendExtractHiddenStatesProposer`(PR #8799,2026-05),官方 spec-decode 文档列出 `extract_hidden_states` + `ExampleHiddenStatesConnector`,且支持 dflash serving;**v0.18.0 稳定版及 v0.19.x 没有**。第 4.2 步实机探测仍要做 |
 | sdpa 稠密 mask 在 CANN 上的算子覆盖 | ❓ 待验证 | 失败则用 eager |
 | muon on NPU | ❓ 待验证 | 失败回退 adamw |
 | MTP 训练 | ❌ 不支持 | 强制 flex attention,需另行适配 |
