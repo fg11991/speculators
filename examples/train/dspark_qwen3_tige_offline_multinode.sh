@@ -22,13 +22,15 @@
 # Multi-node notes for speculators (verified against the code):
 #   - scripts/train.py uses standard torchrun env:// init + hccl; the batch
 #     sampler shards data by global rank. Plain multi-node torchrun just works.
-#   - DDP (default) is the RIGHT strategy across nodes for the small draft:
-#     one gradient all-reduce per step crosses the fabric. Do NOT add
-#     --fsdp-shard on >1 node unless the draft truly cannot fit: it is
-#     ZeRO-3-style sharding across ALL ranks, so every layer's parameter
-#     all-gather crosses the inter-node fabric (DeepSpec measured 29 s/it @
-#     2 nodes -> 180 s/it @ 4 nodes for the same reason). speculators has NO
-#     hybrid_shard/HSDP option.
+#   - DDP (default) is the right strategy across nodes when the draft fits
+#     per card: one gradient all-reduce per step crosses the fabric. When it
+#     does NOT fit (e.g. Qwen3-32B draft), use HSDP: --fsdp-shard together
+#     with --fsdp-shard-size <cards-per-node> shards parameters only WITHIN
+#     each node and replicates across nodes, so the per-layer all-gather
+#     stays on the fast intra-node fabric. Avoid bare --fsdp-shard on >1
+#     node: that is ZeRO-3 across ALL ranks and every all-gather crosses the
+#     inter-node fabric (DeepSpec measured 29 s/it @ 2 nodes -> 180 s/it @
+#     4 nodes for the same reason). Set FSDP_ARGS below.
 #   - There is NO gradient accumulation / global-batch-size knob: effective
 #     batch = NNODES x NPROC_PER_NODE packed sequences per step. Consider
 #     scaling LR when you scale nodes.
@@ -90,6 +92,14 @@ LOSS_FN=${LOSS_FN:-'{"ce": 0.1, "tv": 0.9}'}
 CONFIDENCE_HEAD_ALPHA=${CONFIDENCE_HEAD_ALPHA:-1.0}
 # OPTIMIZER_ARGS="--optimizer adamw"   # fallback if muon misbehaves
 OPTIMIZER_ARGS=${OPTIMIZER_ARGS:-""}
+
+# Sharding. Default (empty) = DDP; fine while the draft fits per card (8B).
+# When it does not (32B draft), enable HSDP: shard within each node,
+# replicate across nodes:
+#   FSDP_ARGS="--fsdp-shard --fsdp-shard-size $NPROC_PER_NODE"
+# Bare "--fsdp-shard" (no shard-size) is global ZeRO-3 -- fine on a single
+# node, slow across nodes.
+FSDP_ARGS=${FSDP_ARGS:-""}
 # =======================================
 
 PREPARE_MARKER="$OUTPUT_DIR/.prepare_complete"
@@ -214,6 +224,7 @@ torchrun \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --draft-attn-impl sdpa \
     $OPTIMIZER_ARGS \
+    $FSDP_ARGS \
     --on-missing raise
 
 echo "[node $NODE_RANK] Done. Checkpoints: $OUTPUT_DIR/checkpoints/"

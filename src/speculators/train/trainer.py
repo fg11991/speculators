@@ -119,6 +119,7 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    fsdp_shard_size: int | None = None
 
 
 def _resolve_scheduler_steps(
@@ -298,7 +299,11 @@ class Trainer:
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
-        apply_fully_sharded(self.model, param_dtype=self.config.hidden_states_dtype)
+        apply_fully_sharded(
+            self.model,
+            param_dtype=self.config.hidden_states_dtype,
+            hsdp_shard_size=self.config.fsdp_shard_size,
+        )
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)

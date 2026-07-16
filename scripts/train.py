@@ -471,6 +471,11 @@ def main(args: argparse.Namespace):  # noqa: C901
             "otherwise parameters are not sharded."
         )
 
+    if args.fsdp_shard_size is not None and not args.fsdp_shard:
+        raise ValueError(
+            "--fsdp-shard-size only applies to FSDP sharding; add --fsdp-shard."
+        )
+
     if get_rank() == 0:
         save_train_command(args.save_path)
 
@@ -625,6 +630,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        fsdp_shard_size=args.fsdp_shard_size,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -1170,6 +1176,16 @@ def parse_args():
         help="Shard model parameters across GPUs with FSDP. By default, "
         "parameters are fully replicated (DDP-like). Enable this when the "
         "model does not fit in a single GPU's memory.",
+    )
+    parser.add_argument(
+        "--fsdp-shard-size",
+        type=int,
+        default=None,
+        help="HSDP: shard parameters only within groups of this many ranks "
+        "(typically the cards per node) and replicate across groups, so the "
+        "per-layer parameter all-gather stays on the fast intra-node fabric. "
+        "Must divide world_size; requires --fsdp-shard. Default: shard "
+        "across all ranks (ZeRO-3). Recommended on multi-node runs.",
     )
 
     # lr scheduler

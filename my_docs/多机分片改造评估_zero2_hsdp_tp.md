@@ -1,7 +1,10 @@
 # speculators 多机分片能力改造评估(ZeRO-2 / HSDP / TP)
 
 > 更新:2026-07-16。目标:补齐 speculators 多机训练的分片策略,对齐 SpecForge。
-> **本文是评估与改造方案,不含已实施代码**。落地前需确认。
+> **状态:选项 B(HSDP)已在 npu-support 分支实施** —— `--fsdp-shard --fsdp-shard-size <每节点卡数>`;
+> 实现:`distributed.py::resolve_hsdp_mesh_dims/build_hsdp_mesh`(2D mesh,(replicate, shard)),
+> `apply_fully_sharded(hsdp_shard_size=...)` 透传,单测 `tests/unit/train/test_hsdp_mesh.py`。
+> 选项 A(ZeRO-2)与 C(TP)仍为待评估方案。上真机前先跑 §6 验证清单。
 > 关联:[[speculators-npu-dsv4-status]]、`glm5.2_adaptation.md`。
 
 ## 1. 问题
