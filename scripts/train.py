@@ -589,6 +589,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         noise_std=args.noise_std,
         legacy_data=args.legacy_data,
+        legacy_data_format=args.legacy_data_format,
         hidden_states_path=args.hidden_states_path,
         vllm_endpoint=args.vllm_endpoint,
         on_missing=args.on_missing,
@@ -849,6 +850,21 @@ def parse_args():
             "DEPRECATED. Use the old data format which stores hidden states alongside "
             "token_ids and assistant_masks, in data_i.pt files. This option will be "
             "removed soon."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-data-format",
+        type=str,
+        default="v1",
+        choices=["v1", "specforge"],
+        help=(
+            "Only with --legacy-data. 'v1' (default): speculators' own .pt format "
+            "(hidden_states is a per-layer list). 'specforge': SpecForge DFlash "
+            "prepare_hidden_states output (--model-type dflash --target-model-backend "
+            "hf; data_i.ckpt with hidden_state/last_hidden_state) read in place -- no "
+            "bulk conversion, any number of layers. --target-layer-ids must match the "
+            "generator's captured ids; validate norm convention with "
+            "scripts/check_specforge_hidden.py before a bulk run."
         ),
     )
     parser.add_argument("--save-path", type=str, default="./output/checkpoints")

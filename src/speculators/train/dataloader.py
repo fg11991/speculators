@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from speculators.train.data import (
+    LEGACY_STANDARDIZE_FNS,
     ArrowDataset,
     BaseDataset,
     SampleFileDataset,
@@ -69,6 +70,7 @@ def create_train_val_loaders(
     hidden_states_dtype: torch.dtype,
     noise_std: float,
     legacy_data: bool,
+    legacy_data_format: str,
     hidden_states_path: str | None,
     vllm_endpoint: str,
     on_missing: Literal["generate", "skip", "warn", "raise"],
@@ -100,17 +102,26 @@ def create_train_val_loaders(
             category=DeprecationWarning,
             stacklevel=2,
         )
+        try:
+            standardize_fn = LEGACY_STANDARDIZE_FNS[legacy_data_format]
+        except KeyError:
+            raise ValueError(
+                f"Unknown --legacy-data-format {legacy_data_format!r}; "
+                f"expected one of {sorted(LEGACY_STANDARDIZE_FNS)}."
+            ) from None
         train_files, val_files = split_files(data_path, ratio=train_data_ratio)
         train_dataset: BaseDataset = SampleFileDataset(
             file_list=train_files,
             max_len=total_seq_len,
             transform=noise_transform,
             hidden_states_dtype=hidden_states_dtype,
+            standardize_fn=standardize_fn,
         )
         val_dataset: BaseDataset = SampleFileDataset(
             file_list=val_files,
             max_len=total_seq_len,
             hidden_states_dtype=hidden_states_dtype,
+            standardize_fn=standardize_fn,
         )
     else:
         train_dataset = ArrowDataset(

@@ -33,7 +33,10 @@ def list_files(path):
     datapath = []
     for root, _directories, files in os.walk(path):
         for file in files:
-            if not file.endswith("pt"):
+            # .pt = speculators' own legacy format; .ckpt (uncompressed) =
+            # SpecForge prepare_hidden_states output. Gzipped .ckpt.gz is not
+            # supported (torch.load cannot mmap it).
+            if not file.endswith((".pt", ".ckpt")):
                 continue
             file_path = Path(root) / file
             datapath.append(file_path)
@@ -112,6 +115,50 @@ def standardize_data_v1(data: dict[str, Any]) -> dict[str, Any]:
         "verifier_last_hidden_states": data["hidden_states"][-1],
         "loss_mask": data["loss_mask"],
     }
+
+
+def _drop_leading_batch_dim(t: torch.Tensor) -> torch.Tensor:
+    # SpecForge stores each per-sample tensor with a leading size-1 batch dim
+    # (``.unsqueeze(0)`` in prepare_hidden_states.py); training wants [seq, ...].
+    if t.dim() >= 1 and t.shape[0] == 1:
+        return t.squeeze(0)
+    return t
+
+
+def standardize_data_specforge(data: dict[str, Any]) -> dict[str, Any]:
+    # SpecForge DFlash prepare_hidden_states.py format
+    # (--model-type dflash --target-model-backend hf, saved as data_i.ckpt):
+    # {
+    #   "input_ids":         [seq_len],
+    #   "loss_mask":         [seq_len],
+    #   "hidden_state":      [1, seq_len, K * hidden_size]  (the K captured
+    #                         target_layer_ids, concatenated on the last dim),
+    #   "last_hidden_state": [1, seq_len, hidden_size]  (verifier final layer),
+    #   "aux_hidden_state":  None,
+    # }
+    # DFlash's `hidden_state` is the draft fc input and `last_hidden_state` is the
+    # verifier target source -- exactly speculators' two fields:
+    #   hidden_state      -> hidden_states (fc input, K captured layers)
+    #   last_hidden_state -> verifier_last_hidden_states
+    # K must equal len(--target-layer-ids) in training, in the same order (the
+    # generator prints the captured layer ids -- keep them identical).
+    # NOTE: `last_hidden_state` must be the PRE-final-norm state, because the
+    # draft applies verifier_norm before verifier_lm_head. Validate once against
+    # a real sample before a bulk run (scripts/check_specforge_hidden.py).
+    return {
+        "hidden_states": _drop_leading_batch_dim(data["hidden_state"]),
+        "input_ids": _drop_leading_batch_dim(data["input_ids"]),
+        "verifier_last_hidden_states": _drop_leading_batch_dim(
+            data["last_hidden_state"]
+        ),
+        "loss_mask": _drop_leading_batch_dim(data["loss_mask"]),
+    }
+
+
+LEGACY_STANDARDIZE_FNS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "v1": standardize_data_v1,
+    "specforge": standardize_data_specforge,
+}
 
 
 def _has_multimodal_content(messages: list[dict]) -> bool:
@@ -406,6 +453,9 @@ class SampleFileDataset(BaseDataset):
         file_list: list[str] | None = None,
         transform: TransformTensors | None = None,
         hidden_states_dtype: torch.dtype = torch.bfloat16,
+        standardize_fn: Callable[
+            [dict[str, Any]], dict[str, Any]
+        ] = standardize_data_v1,
     ):
         """Initialize the SampleFileDataset.
         Args:
@@ -442,6 +492,9 @@ class SampleFileDataset(BaseDataset):
             )
 
         self.data: list[str] = file_list
+        # Set before super().__init__: _compute_approx_lengths -> __getitem__ ->
+        # _get_raw_data reads self.standardize_fn during construction.
+        self.standardize_fn = standardize_fn
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -488,7 +541,7 @@ class SampleFileDataset(BaseDataset):
         ]
 
     def _get_raw_data(self, index):
-        return standardize_data_v1(
+        return self.standardize_fn(
             torch.load(
                 self.data[index], mmap=True, weights_only=True, map_location="cpu"
             )
