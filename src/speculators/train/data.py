@@ -1,3 +1,5 @@
+import gzip
+import io
 import json
 import math
 import os
@@ -33,15 +35,27 @@ def list_files(path):
     datapath = []
     for root, _directories, files in os.walk(path):
         for file in files:
-            # .pt = speculators' own legacy format; .ckpt (uncompressed) =
-            # SpecForge prepare_hidden_states output. Gzipped .ckpt.gz is not
-            # supported (torch.load cannot mmap it).
-            if not file.endswith((".pt", ".ckpt")):
+            # .pt = speculators' own legacy format; .ckpt / .ckpt.gz =
+            # SpecForge prepare_hidden_states output (uncompressed / gzipped).
+            if not file.endswith((".pt", ".ckpt", ".ckpt.gz")):
                 continue
             file_path = Path(root) / file
             datapath.append(file_path)
 
     return datapath
+
+
+def _load_sample_file(path) -> dict[str, Any]:
+    # Mirror SpecForge's own loader (data/preprocessing.py): a gzipped .ckpt.gz
+    # must be fully decompressed into memory first -- torch.load cannot mmap
+    # compressed data; plain .pt/.ckpt are memory-mapped as before.
+    path_str = str(path)
+    if path_str.endswith(".gz"):
+        with gzip.open(path_str, "rb") as f:
+            return torch.load(
+                io.BytesIO(f.read()), weights_only=True, map_location="cpu"
+            )
+    return torch.load(path_str, mmap=True, weights_only=True, map_location="cpu")
 
 
 def slice_and_pad_to_length(tensor, length):
@@ -541,11 +555,7 @@ class SampleFileDataset(BaseDataset):
         ]
 
     def _get_raw_data(self, index):
-        return self.standardize_fn(
-            torch.load(
-                self.data[index], mmap=True, weights_only=True, map_location="cpu"
-            )
-        )
+        return self.standardize_fn(_load_sample_file(self.data[index]))
 
 
 def create_collate_fn(

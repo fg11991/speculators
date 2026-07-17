@@ -71,8 +71,11 @@ torchrun --standalone --nproc_per_node <N> scripts/train.py \
 ```
 
 **文件兼容(已在 speculators 侧处理)**:
-- `list_files` 现在收 `.pt` 和 `.ckpt`,`os.walk` 递归 `rows_X-Y/` 子目录 → 直接能发现;
-- **生成时不要加 `--compress`**:`.ckpt.gz` 无法被 `torch.load(mmap=True)` 读,也不被 `list_files` 收。
+- `list_files` 收 `.pt` / `.ckpt` / `.ckpt.gz`,`os.walk` 递归 `rows_X-Y/` 子目录 → 直接能发现;
+- **`--compress` 现已支持**:`.ckpt.gz` 会 `gzip.open` 解压到内存再 `torch.load`(照搬 SpecForge
+  `data/preprocessing.py` 的读法)。权衡:压缩省存储,但读时每样本要解压(吃 CPU,靠 `--num-workers`
+  并行摊掉),且 gz 文件失去 mmap、multipack 的长度估计按压缩后大小会略糙(只影响打包效率,不影响
+  正确性)。bf16 hidden 是高熵浮点,gzip 压缩比有限,值不值得先拿一批实测压缩率再定。
 
 ## 4. 上量前必跑一次校验
 

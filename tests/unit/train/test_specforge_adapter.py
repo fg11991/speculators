@@ -1,7 +1,10 @@
+import gzip
+
 import torch
 
 from speculators.train.data import (
     LEGACY_STANDARDIZE_FNS,
+    _load_sample_file,
     standardize_data_specforge,
     standardize_data_v1,
 )
@@ -68,3 +71,21 @@ def test_specforge_dflash_matches_v1_layout():
 def test_registry_exposes_both():
     assert LEGACY_STANDARDIZE_FNS["v1"] is standardize_data_v1
     assert LEGACY_STANDARDIZE_FNS["specforge"] is standardize_data_specforge
+
+
+def test_load_sample_file_plain_and_gzip_roundtrip(tmp_path):
+    # SpecForge saves .ckpt (plain) or .ckpt.gz (--compress). Both must load to
+    # the same dict; gz mirrors SpecForge's gzip.open + BytesIO path.
+    sample = _dflash_sample()
+
+    plain = tmp_path / "data_0.ckpt"
+    torch.save(sample, plain)
+    gz = tmp_path / "data_1.ckpt.gz"
+    with gzip.open(gz, "wb") as f:
+        torch.save(sample, f)
+
+    for path in (plain, gz):
+        loaded = _load_sample_file(path)
+        out = standardize_data_specforge(loaded)
+        assert out["hidden_states"].shape == (SEQ, NUM_LAYERS * HID)
+        assert out["verifier_last_hidden_states"].shape == (SEQ, HID)

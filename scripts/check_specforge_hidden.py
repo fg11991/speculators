@@ -28,7 +28,7 @@ import sys
 import torch
 from transformers import AutoModelForCausalLM
 
-from speculators.train.data import standardize_data_specforge
+from speculators.train.data import _load_sample_file, standardize_data_specforge
 
 # A weak sanity floor. Real natural-text teacher-forcing accuracy is usually far
 # higher; this only needs to separate "sensible logits" from "garbage".
@@ -37,7 +37,7 @@ _MIN_NEXT_TOKEN_ACC = 0.3
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("sample", help="One SpecForge DFlash data_i.ckpt (uncompressed)")
+    ap.add_argument("sample", help="One SpecForge DFlash data_i.ckpt or .ckpt.gz")
     ap.add_argument("--verifier-name-or-path", required=True)
     ap.add_argument(
         "--num-target-layers",
@@ -47,7 +47,7 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    raw = torch.load(args.sample, weights_only=True, map_location="cpu")
+    raw = _load_sample_file(args.sample)  # handles .ckpt and .ckpt.gz
     print(f"raw keys: {sorted(raw)}")
 
     std = standardize_data_specforge(raw)
