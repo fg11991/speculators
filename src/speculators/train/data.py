@@ -1,5 +1,9 @@
+import gzip
+import io
 import json
+import logging
 import math
+import multiprocessing
 import os
 import random
 import shutil
@@ -26,6 +30,8 @@ from speculators.data_generation.vllm_client import (
 )
 from speculators.train.noise_transforms import TransformTensors
 
+logger = logging.getLogger("speculators")
+
 BatchType = dict[str, Any]
 
 
@@ -33,12 +39,27 @@ def list_files(path):
     datapath = []
     for root, _directories, files in os.walk(path):
         for file in files:
-            if not file.endswith("pt"):
+            # .pt = speculators' own legacy format; .ckpt / .ckpt.gz =
+            # SpecForge prepare_hidden_states output (uncompressed / gzipped).
+            if not file.endswith((".pt", ".ckpt", ".ckpt.gz")):
                 continue
             file_path = Path(root) / file
             datapath.append(file_path)
 
     return datapath
+
+
+def _load_sample_file(path) -> dict[str, Any]:
+    # Mirror SpecForge's own loader (data/preprocessing.py): a gzipped .ckpt.gz
+    # must be fully decompressed into memory first -- torch.load cannot mmap
+    # compressed data; plain .pt/.ckpt are memory-mapped as before.
+    path_str = str(path)
+    if path_str.endswith(".gz"):
+        with gzip.open(path_str, "rb") as f:
+            return torch.load(
+                io.BytesIO(f.read()), weights_only=True, map_location="cpu"
+            )
+    return torch.load(path_str, mmap=True, weights_only=True, map_location="cpu")
 
 
 def slice_and_pad_to_length(tensor, length):
@@ -112,6 +133,50 @@ def standardize_data_v1(data: dict[str, Any]) -> dict[str, Any]:
         "verifier_last_hidden_states": data["hidden_states"][-1],
         "loss_mask": data["loss_mask"],
     }
+
+
+def _drop_leading_batch_dim(t: torch.Tensor) -> torch.Tensor:
+    # SpecForge stores each per-sample tensor with a leading size-1 batch dim
+    # (``.unsqueeze(0)`` in prepare_hidden_states.py); training wants [seq, ...].
+    if t.dim() >= 1 and t.shape[0] == 1:
+        return t.squeeze(0)
+    return t
+
+
+def standardize_data_specforge(data: dict[str, Any]) -> dict[str, Any]:
+    # SpecForge DFlash prepare_hidden_states.py format
+    # (--model-type dflash --target-model-backend hf, saved as data_i.ckpt):
+    # {
+    #   "input_ids":         [seq_len],
+    #   "loss_mask":         [seq_len],
+    #   "hidden_state":      [1, seq_len, K * hidden_size]  (the K captured
+    #                         target_layer_ids, concatenated on the last dim),
+    #   "last_hidden_state": [1, seq_len, hidden_size]  (verifier final layer),
+    #   "aux_hidden_state":  None,
+    # }
+    # DFlash's `hidden_state` is the draft fc input and `last_hidden_state` is the
+    # verifier target source -- exactly speculators' two fields:
+    #   hidden_state      -> hidden_states (fc input, K captured layers)
+    #   last_hidden_state -> verifier_last_hidden_states
+    # K must equal len(--target-layer-ids) in training, in the same order (the
+    # generator prints the captured layer ids -- keep them identical).
+    # NOTE: `last_hidden_state` must be the PRE-final-norm state, because the
+    # draft applies verifier_norm before verifier_lm_head. Validate once against
+    # a real sample before a bulk run (scripts/check_specforge_hidden.py).
+    return {
+        "hidden_states": _drop_leading_batch_dim(data["hidden_state"]),
+        "input_ids": _drop_leading_batch_dim(data["input_ids"]),
+        "verifier_last_hidden_states": _drop_leading_batch_dim(
+            data["last_hidden_state"]
+        ),
+        "loss_mask": _drop_leading_batch_dim(data["loss_mask"]),
+    }
+
+
+LEGACY_STANDARDIZE_FNS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "v1": standardize_data_v1,
+    "specforge": standardize_data_specforge,
+}
 
 
 def _has_multimodal_content(messages: list[dict]) -> bool:
@@ -406,6 +471,10 @@ class SampleFileDataset(BaseDataset):
         file_list: list[str] | None = None,
         transform: TransformTensors | None = None,
         hidden_states_dtype: torch.dtype = torch.bfloat16,
+        standardize_fn: Callable[
+            [dict[str, Any]], dict[str, Any]
+        ] = standardize_data_v1,
+        skip_bad: bool = False,
     ):
         """Initialize the SampleFileDataset.
         Args:
@@ -419,6 +488,11 @@ class SampleFileDataset(BaseDataset):
             transform: The transform to apply to the data.
             hidden_states_dtype: The dtype of the hidden states.
             standardize_fn: The function to standardize the data.
+            skip_bad: If True, a sample that fails to load/standardize (e.g. a
+            truncated or key-missing SpecForge .ckpt) is skipped (``__getitem__``
+            returns None, which the collate_fn already drops) instead of raising.
+            Each skip is logged and counted; see ``take_skipped_count``. Defaults
+            to False, which preserves the original strict behavior.
 
             Note: datapath or file_list must be provided, but not both.
 
@@ -442,6 +516,14 @@ class SampleFileDataset(BaseDataset):
             )
 
         self.data: list[str] = file_list
+        # Set before super().__init__: _compute_approx_lengths -> __getitem__ ->
+        # _get_raw_data reads self.standardize_fn during construction.
+        self.standardize_fn = standardize_fn
+        self.skip_bad = skip_bad
+        # Shared across DataLoader worker processes (created before fork) so the
+        # main process can read the per-epoch tally. Only allocated when skipping
+        # is enabled, so the default path adds nothing.
+        self._skipped = multiprocessing.Value("l", 0) if skip_bad else None
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -488,11 +570,29 @@ class SampleFileDataset(BaseDataset):
         ]
 
     def _get_raw_data(self, index):
-        return standardize_data_v1(
-            torch.load(
-                self.data[index], mmap=True, weights_only=True, map_location="cpu"
-            )
-        )
+        if not self.skip_bad:
+            return self.standardize_fn(_load_sample_file(self.data[index]))
+        try:
+            return self.standardize_fn(_load_sample_file(self.data[index]))
+        except Exception as e:  # noqa: BLE001 - any unreadable/corrupt sample
+            if self._skipped is not None:
+                with self._skipped.get_lock():
+                    self._skipped.value += 1
+            logger.warning(f"[skip bad sample] {self.data[index]}: {e!r}")
+            return None
+
+    def take_skipped_count(self) -> int:
+        """Return the number of samples skipped since the last call, and reset.
+
+        Returns 0 when skipping is disabled. Safe to call once per epoch from the
+        main process; the counter is shared with the DataLoader workers.
+        """
+        if self._skipped is None:
+            return 0
+        with self._skipped.get_lock():
+            n = self._skipped.value
+            self._skipped.value = 0
+        return n
 
 
 def create_collate_fn(

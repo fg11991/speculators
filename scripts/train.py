@@ -29,6 +29,7 @@ from speculators.models.utils import (
 from speculators.train.dataloader import create_train_val_loaders
 from speculators.train.distributed import (
     get_rank,
+    is_distributed,
     maybe_destroy_distributed,
     maybe_setup_distributed,
 )
@@ -41,6 +42,7 @@ from speculators.train.vocab_mapping import (
 )
 from speculators.utils.argparse_utils import explicitly_provided_dests
 from speculators.utils.loading import is_config_only_dir
+from speculators.utils.util import empty_cache, is_npu_available, manual_seed_all
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
     np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    manual_seed_all(seed)
 
     if deterministic:
         # For deterministic behavior (may impact performance)
@@ -310,6 +312,7 @@ def _build_from_config_only(
     t2d: torch.Tensor | None,
     d2t: torch.Tensor | None,
     verifier_name_or_path: str | None = None,
+    draft_attn_impl: str | None = None,
 ) -> SpeculatorModel:
     """Initialize a fresh draft from a saved speculator *config* (no weights).
 
@@ -318,6 +321,8 @@ def _build_from_config_only(
     no trained draft weights to restore (decoder weights are randomly initialized).
     """
     config = model_class.config_class.from_pretrained(path)
+    if draft_attn_impl is not None:
+        config.transformer_layer_config._attn_implementation = draft_attn_impl
     speculators_config = getattr(config, "speculators_config", None)
     # Fall back to the CLI --verifier-name-or-path only when the saved config has
     # no verifier path -- either null or blanked to "". A real path in the config
@@ -370,6 +375,23 @@ def build_draft_model(
                 t2d=t2d,
                 d2t=d2t,
                 verifier_name_or_path=args.verifier_name_or_path,
+                draft_attn_impl=(
+                    args.draft_attn_impl if args.speculator_type != "mtp" else None
+                ),
+            )
+        if args.speculator_type != "mtp":
+            # _attn_implementation is never serialized by HF configs, so re-apply
+            # the CLI selection before construction -- mirroring from_training_args.
+            # MTP is skipped: its from_training_args never sets the field and its
+            # __init__ resolves its own default ("eager") when it is absent.
+            config = model_class.config_class.from_pretrained(args.from_pretrained)
+            config.transformer_layer_config._attn_implementation = args.draft_attn_impl
+            return model_class.from_pretrained(
+                args.from_pretrained,
+                config=config,
+                t2d=t2d,
+                d2t=d2t,
+                verifier=args.verifier_name_or_path,
             )
         return model_class.from_pretrained(
             args.from_pretrained,
@@ -443,6 +465,17 @@ def main(args: argparse.Namespace):  # noqa: C901
     # Setup distributed training
     maybe_setup_distributed()
 
+    if args.fsdp_shard and not is_distributed():
+        raise ValueError(
+            "--fsdp-shard requires launching with torchrun/distributed training; "
+            "otherwise parameters are not sharded."
+        )
+
+    if args.fsdp_shard_size is not None and not args.fsdp_shard:
+        raise ValueError(
+            "--fsdp-shard-size only applies to FSDP sharding; add --fsdp-shard."
+        )
+
     if get_rank() == 0:
         save_train_command(args.save_path)
 
@@ -451,6 +484,27 @@ def main(args: argparse.Namespace):  # noqa: C901
             "--hidden-states-dtype must be a dtype attribute of torch. e.g. `bfloat16`"
         )
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
+
+    if hidden_states_dtype == torch.float16:
+        raise ValueError(
+            "--hidden-states-dtype=float16 is not supported. "
+            "float16 with torch.autocast requires gradient scaling (GradScaler) to "
+            "prevent gradient underflow, which is not implemented. "
+            "Use bfloat16 instead, which provides the same memory savings with "
+            "better numerical stability and no gradient scaling required."
+        )
+
+    # Flex attention requires the inductor backend, which Ascend NPU lacks.
+    if (
+        args.speculator_type != "mtp"
+        and args.draft_attn_impl == "simple_flex_attention"
+        and is_npu_available()
+    ):
+        logger.warning(
+            "simple_flex_attention is unavailable on Ascend NPU; "
+            "falling back to --draft-attn-impl sdpa."
+        )
+        args.draft_attn_impl = "sdpa"
 
     if args.speculator_type == "mtp":
         if args.draft_attn_impl != "simple_flex_attention":
@@ -501,9 +555,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     # config/weights can be validated (e.g. in vLLM). The saved checkpoint can be
     # fed straight back via --from-pretrained to start training.
     if args.dry_run:
-        # Match Trainer.setup_model: weights are (re)initialized in
-        # hidden_states_dtype, so save the dry-run checkpoint in that dtype too
-        # rather than the float32 the model is built in.
+        # Save in hidden_states_dtype (bf16) for compact checkpoints.
         draft_model.to(hidden_states_dtype)
         if get_rank() == 0:
             logger.info(
@@ -537,6 +589,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         noise_std=args.noise_std,
         legacy_data=args.legacy_data,
+        legacy_data_format=args.legacy_data_format,
         hidden_states_path=args.hidden_states_path,
         vllm_endpoint=args.vllm_endpoint,
         on_missing=args.on_missing,
@@ -577,6 +630,8 @@ def main(args: argparse.Namespace):  # noqa: C901
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
+        fsdp_shard=args.fsdp_shard,
+        fsdp_shard_size=args.fsdp_shard_size,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -586,8 +641,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     # Cleanup
     del trainer, draft_model
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    empty_cache()
     maybe_destroy_distributed()
 
 
@@ -798,6 +852,21 @@ def parse_args():
             "removed soon."
         ),
     )
+    parser.add_argument(
+        "--legacy-data-format",
+        type=str,
+        default="v1",
+        choices=["v1", "specforge"],
+        help=(
+            "Only with --legacy-data. 'v1' (default): speculators' own .pt format "
+            "(hidden_states is a per-layer list). 'specforge': SpecForge DFlash "
+            "prepare_hidden_states output (--model-type dflash --target-model-backend "
+            "hf; data_i.ckpt with hidden_state/last_hidden_state) read in place -- no "
+            "bulk conversion, any number of layers. --target-layer-ids must match the "
+            "generator's captured ids; validate norm convention with "
+            "scripts/check_specforge_hidden.py before a bulk run."
+        ),
+    )
     parser.add_argument("--save-path", type=str, default="./output/checkpoints")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -910,7 +979,10 @@ def parse_args():
         "--hidden-states-dtype",
         type=str,
         default="bfloat16",
-        help="The dtype to initialize model weights and dataloader hidden states to",
+        help="Data type for dataloader hidden states and autocast compute. "
+        "Model master weights are always kept in fp32. "
+        "Options: float32 (full precision), bfloat16 (recommended). "
+        "Note: float16 is not supported (requires gradient scaling).",
     )
     parser.add_argument(
         "--deterministic-cuda",
@@ -1112,6 +1184,26 @@ def parse_args():
         help="Pointing to checkpoint with lowest validation loss.",
     )
 
+    # distributed strategy
+    parser.add_argument(
+        "--fsdp-shard",
+        action="store_true",
+        default=False,
+        help="Shard model parameters across GPUs with FSDP. By default, "
+        "parameters are fully replicated (DDP-like). Enable this when the "
+        "model does not fit in a single GPU's memory.",
+    )
+    parser.add_argument(
+        "--fsdp-shard-size",
+        type=int,
+        default=None,
+        help="HSDP: shard parameters only within groups of this many ranks "
+        "(typically the cards per node) and replicate across groups, so the "
+        "per-layer parameter all-gather stays on the fast intra-node fabric. "
+        "Must divide world_size; requires --fsdp-shard. Default: shard "
+        "across all ranks (ZeRO-3). Recommended on multi-node runs.",
+    )
+
     # lr scheduler
     parser.add_argument(
         "--scheduler-type",
@@ -1199,7 +1291,10 @@ if __name__ == "__main__":
 
 # RUN WITH:
 # torchrun --standalone --nproc_per_node=<num_gpus>  scripts/train.py
-# for FSDP training
+# for multi-GPU training (DDP by default)
+# OR
+# torchrun --standalone --nproc_per_node=<num_gpus>  scripts/train.py --fsdp-shard
+# for FSDP sharded training (when model doesn't fit in a single GPU)
 # OR
 # python scripts/train.py
 # for single GPU training

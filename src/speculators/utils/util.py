@@ -52,3 +52,27 @@ def empty_cache():
     if hasattr(mod, "empty_cache"):
         mod.empty_cache()
     return
+
+
+def synchronize():
+    """Synchronize the current accelerator (cuda, npu, ...); no-op without one."""
+    acc = torch.accelerator.current_accelerator()
+    if acc is None:
+        return
+
+    mod = torch.get_device_module(acc)
+    if hasattr(mod, "synchronize"):
+        mod.synchronize()
+    return
+
+
+def manual_seed_all(seed: int):
+    """Seed the current accelerator's RNG on all devices; no-op without one."""
+    acc = torch.accelerator.current_accelerator()
+    if acc is None:
+        return
+
+    mod = torch.get_device_module(acc)
+    if hasattr(mod, "manual_seed_all"):
+        mod.manual_seed_all(seed)
+    return

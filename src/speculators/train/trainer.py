@@ -11,6 +11,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
 )
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
@@ -34,15 +35,16 @@ from speculators.train.distributed import (
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.utils import normalize_counted_metrics
+from speculators.utils.util import synchronize
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 
 class _StepTimer:
-    # Each mark()/now() forces a cuda.synchronize to capture true GPU time.
-    # This serialises the CUDA pipeline, so profiled steps are slower; keep
-    # log_freq > 1 in perf-sensitive runs.
+    # Each mark()/now() forces an accelerator synchronize (cuda, npu, ...) to
+    # capture true device time. This serialises the device pipeline, so profiled
+    # steps are slower; keep log_freq > 1 in perf-sensitive runs.
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
         self._marks: dict[str, float] = {}
@@ -53,7 +55,7 @@ class _StepTimer:
 
     def mark(self, name: str) -> None:
         if self.enabled:
-            torch.cuda.synchronize()
+            synchronize()
             self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
@@ -63,7 +65,7 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        torch.cuda.synchronize()
+        synchronize()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:
@@ -116,6 +118,8 @@ class TrainerConfig(NamedTuple):
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
+    fsdp_shard: bool = False
+    fsdp_shard_size: int | None = None
 
 
 def _resolve_scheduler_steps(
@@ -172,8 +176,12 @@ class Trainer:
         self.val_loader = val_loader
         self.is_distributed = is_distributed()
         self.resume_from_checkpoint = config.resume_from_checkpoint
-        checkpointer_class = (
-            DistributedCheckpointer if self.is_distributed else SingleGPUCheckpointer
+        acc = torch.accelerator.current_accelerator()
+        self.device_type = acc.type if acc is not None else "cuda"
+        checkpointer_class: type[BaseCheckpointer] = (
+            DistributedCheckpointer
+            if self.is_distributed and config.fsdp_shard
+            else SingleGPUCheckpointer
         )
         self.checkpointer: BaseCheckpointer = checkpointer_class(self.config.save_path)
 
@@ -270,25 +278,32 @@ class Trainer:
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
 
-        self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
         )
 
         if not self.is_distributed:
-            # Single device case
             self.model.to(self.local_rank)  # type: ignore[arg-type]
             if load_checkpoint:
                 self.checkpointer.load_model_state_dict(self.model)
             return
 
-        # Distributed case
+        if self.config.fsdp_shard:
+            self._setup_model_fsdp(load_checkpoint)
+        else:
+            self._setup_model_ddp(load_checkpoint)
+
+    def _setup_model_fsdp(self, load_checkpoint: bool):
         # Capture full state dict on rank 0 before FSDP sharding
         full_state_dict = {}
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
-        apply_fully_sharded(self.model)
+        apply_fully_sharded(
+            self.model,
+            param_dtype=self.config.hidden_states_dtype,
+            hsdp_shard_size=self.config.fsdp_shard_size,
+        )
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
@@ -305,6 +320,21 @@ class Trainer:
             )
             del full_state_dict
             dist.barrier()
+
+    def _setup_model_ddp(self, load_checkpoint: bool):
+        self.model.to(self.local_rank)  # type: ignore[arg-type]
+
+        if load_checkpoint:
+            if dist.get_rank() == 0:
+                self.checkpointer.load_model_state_dict(self.model)
+        else:
+            # Fresh init: broadcast rank 0's random initialization to all ranks
+            for param in self.model.parameters():
+                dist.broadcast(param.data, src=0)
+            dist.barrier()
+
+        # DDP constructor broadcasts rank 0's params to all ranks
+        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -427,10 +457,13 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            timer.mark("fetch")
-            _draft_tokens, loss, metrics = self.model(
-                **gpu_batch, **(self.config.train_call_kwargs or {})
-            )
+            with torch.autocast(
+                self.device_type, dtype=self.config.hidden_states_dtype
+            ):
+                timer.mark("fetch")
+                _draft_tokens, loss, metrics = self.model(
+                    **gpu_batch, **(self.config.train_call_kwargs or {})
+                )
 
             timer.mark("fwd")
             self._optimizers_zero_grad()
@@ -505,9 +538,12 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            _draft_tokens, _loss, metrics = self.model(
-                **gpu_batch, **(self.config.val_call_kwargs or {})
-            )
+            with torch.autocast(
+                self.device_type, dtype=self.config.hidden_states_dtype
+            ):
+                _draft_tokens, _loss, metrics = self.model(
+                    **gpu_batch, **(self.config.val_call_kwargs or {})
+                )
 
             if self.is_distributed:
                 for m in metrics.values():
@@ -583,6 +619,30 @@ class Trainer:
         if self.config.save_best:
             self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
 
+    def _report_skipped_samples(self, epoch: int, n_epochs: int) -> None:
+        """Log how many corrupt/unreadable samples were skipped this epoch.
+
+        No-op unless the dataset supports skipping (legacy loader with
+        --on-missing skip). Counts are summed across ranks and logged on rank 0.
+        """
+        total = 0
+        for loader in (self.train_loader, self.val_loader):
+            dataset = getattr(loader, "dataset", None)
+            take = getattr(dataset, "take_skipped_count", None)
+            if callable(take):
+                total += take()
+
+        if self.is_distributed:
+            counter = torch.tensor([total], device=self.local_rank)
+            dist.all_reduce(counter)
+            total = int(counter.item())
+
+        if self.rank == 0 and total > 0:
+            root_logger.warning(
+                f"[epoch {epoch + 1}/{n_epochs}] skipped {total} bad sample(s) "
+                "(unreadable/corrupt hidden-state files)"
+            )
+
     @with_graceful_shutdown()
     def run_training(self):
         n_epochs = self.config.num_epochs
@@ -590,6 +650,7 @@ class Trainer:
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
+            self._report_skipped_samples(epoch, n_epochs)
 
             if self.is_distributed:
                 dist.barrier()
