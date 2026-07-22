@@ -619,6 +619,30 @@ class Trainer:
         if self.config.save_best:
             self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
 
+    def _report_skipped_samples(self, epoch: int, n_epochs: int) -> None:
+        """Log how many corrupt/unreadable samples were skipped this epoch.
+
+        No-op unless the dataset supports skipping (legacy loader with
+        --on-missing skip). Counts are summed across ranks and logged on rank 0.
+        """
+        total = 0
+        for loader in (self.train_loader, self.val_loader):
+            dataset = getattr(loader, "dataset", None)
+            take = getattr(dataset, "take_skipped_count", None)
+            if callable(take):
+                total += take()
+
+        if self.is_distributed:
+            counter = torch.tensor([total], device=self.local_rank)
+            dist.all_reduce(counter)
+            total = int(counter.item())
+
+        if self.rank == 0 and total > 0:
+            root_logger.warning(
+                f"[epoch {epoch + 1}/{n_epochs}] skipped {total} bad sample(s) "
+                "(unreadable/corrupt hidden-state files)"
+            )
+
     @with_graceful_shutdown()
     def run_training(self):
         n_epochs = self.config.num_epochs
@@ -626,6 +650,7 @@ class Trainer:
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
+            self._report_skipped_samples(epoch, n_epochs)
 
             if self.is_distributed:
                 dist.barrier()

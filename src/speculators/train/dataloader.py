@@ -110,18 +110,23 @@ def create_train_val_loaders(
                 f"expected one of {sorted(LEGACY_STANDARDIZE_FNS)}."
             ) from None
         train_files, val_files = split_files(data_path, ratio=train_data_ratio)
+        # Reuse the existing --on-missing switch: "skip" makes the legacy loader
+        # tolerate unreadable/corrupt .ckpt samples instead of crashing the run.
+        skip_bad = on_missing == "skip"
         train_dataset: BaseDataset = SampleFileDataset(
             file_list=train_files,
             max_len=total_seq_len,
             transform=noise_transform,
             hidden_states_dtype=hidden_states_dtype,
             standardize_fn=standardize_fn,
+            skip_bad=skip_bad,
         )
         val_dataset: BaseDataset = SampleFileDataset(
             file_list=val_files,
             max_len=total_seq_len,
             hidden_states_dtype=hidden_states_dtype,
             standardize_fn=standardize_fn,
+            skip_bad=skip_bad,
         )
     else:
         train_dataset = ArrowDataset(

@@ -1,7 +1,9 @@
 import gzip
 import io
 import json
+import logging
 import math
+import multiprocessing
 import os
 import random
 import shutil
@@ -27,6 +29,8 @@ from speculators.data_generation.vllm_client import (
     wait_for_lock,
 )
 from speculators.train.noise_transforms import TransformTensors
+
+logger = logging.getLogger("speculators")
 
 BatchType = dict[str, Any]
 
@@ -470,6 +474,7 @@ class SampleFileDataset(BaseDataset):
         standardize_fn: Callable[
             [dict[str, Any]], dict[str, Any]
         ] = standardize_data_v1,
+        skip_bad: bool = False,
     ):
         """Initialize the SampleFileDataset.
         Args:
@@ -483,6 +488,11 @@ class SampleFileDataset(BaseDataset):
             transform: The transform to apply to the data.
             hidden_states_dtype: The dtype of the hidden states.
             standardize_fn: The function to standardize the data.
+            skip_bad: If True, a sample that fails to load/standardize (e.g. a
+            truncated or key-missing SpecForge .ckpt) is skipped (``__getitem__``
+            returns None, which the collate_fn already drops) instead of raising.
+            Each skip is logged and counted; see ``take_skipped_count``. Defaults
+            to False, which preserves the original strict behavior.
 
             Note: datapath or file_list must be provided, but not both.
 
@@ -509,6 +519,11 @@ class SampleFileDataset(BaseDataset):
         # Set before super().__init__: _compute_approx_lengths -> __getitem__ ->
         # _get_raw_data reads self.standardize_fn during construction.
         self.standardize_fn = standardize_fn
+        self.skip_bad = skip_bad
+        # Shared across DataLoader worker processes (created before fork) so the
+        # main process can read the per-epoch tally. Only allocated when skipping
+        # is enabled, so the default path adds nothing.
+        self._skipped = multiprocessing.Value("l", 0) if skip_bad else None
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -555,7 +570,29 @@ class SampleFileDataset(BaseDataset):
         ]
 
     def _get_raw_data(self, index):
-        return self.standardize_fn(_load_sample_file(self.data[index]))
+        if not self.skip_bad:
+            return self.standardize_fn(_load_sample_file(self.data[index]))
+        try:
+            return self.standardize_fn(_load_sample_file(self.data[index]))
+        except Exception as e:  # noqa: BLE001 - any unreadable/corrupt sample
+            if self._skipped is not None:
+                with self._skipped.get_lock():
+                    self._skipped.value += 1
+            logger.warning(f"[skip bad sample] {self.data[index]}: {e!r}")
+            return None
+
+    def take_skipped_count(self) -> int:
+        """Return the number of samples skipped since the last call, and reset.
+
+        Returns 0 when skipping is disabled. Safe to call once per epoch from the
+        main process; the counter is shared with the DataLoader workers.
+        """
+        if self._skipped is None:
+            return 0
+        with self._skipped.get_lock():
+            n = self._skipped.value
+            self._skipped.value = 0
+        return n
 
 
 def create_collate_fn(
