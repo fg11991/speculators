@@ -265,6 +265,24 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             loss_mask, max_anchors, self.block_size
         )
 
+        # Anchor sharding (sp_size>1): every SP rank agrees on the same global
+        # sample, then keeps its 1/sp stride. Base sequence stays replicated, so
+        # each anchor still attends to its full prefix. No-op at sp_size==1.
+        from speculators.train.distributed import (  # noqa: PLC0415
+            get_sp_group,
+            get_sp_rank,
+            get_sp_size,
+        )
+
+        if get_sp_size() > 1:
+            from speculators.train.sequence_parallel import (  # noqa: PLC0415
+                shard_anchors,
+            )
+
+            anchor_positions, anchor_valid = shard_anchors(
+                anchor_positions, anchor_valid, get_sp_group(), get_sp_rank()
+            )
+
         full_attn_mask = None
         if self.uses_full_attn:
             full_attn_mask = self._create_attention_mask(
@@ -316,6 +334,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
             self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
         )
+        # After anchor sharding this rank holds only its local anchors; every
+        # tensor below is sized from the local count (== global at sp_size==1).
+        num_anchors = anchor_positions.shape[0]
 
         mask_tokens_size = num_anchors * self.block_size
 
@@ -424,5 +445,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             dpace_alpha=dpace_alpha,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
+
+        # Anchor sharding (sp_size>1): rescale so the global DDP-averaged gradient
+        # equals a single-rank run over all anchors. No-op / byte-identical at
+        # sp_size==1 (scale == 1.0).
+        from speculators.train.distributed import get_sp_group, get_sp_size  # noqa: PLC0415
+
+        if get_sp_size() > 1:
+            from speculators.train.sequence_parallel import anchor_loss_scale  # noqa: PLC0415
+
+            loss = loss * anchor_loss_scale(aligned_loss_mask.sum(), get_sp_group())
 
         return draft_tokens, loss, metrics

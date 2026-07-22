@@ -108,3 +108,55 @@ def scatter_seq_gather_heads(
     (heads sharded), ...]`` -> ``[..., s_local (full heads), ...]``. Scatters the
     sequence, gathers the heads."""
     return all_to_all(x, scatter_dim=seq_dim, gather_dim=head_dim, group=group)
+
+
+# ---------------------------------------------------------------------------
+# Anchor sharding (DSpark-native cross-device scaling)
+#
+# Instead of sharding the token sequence (Ulysses), we replicate the (small) base
+# sequence and shard the *anchor blocks* -- which are conditionally independent in
+# DSpark (blocks never attend to each other). Each rank computes 1/sp of the
+# anchors; the dominant ``[T, vocab]`` tensors shrink ~sp. See
+# ``my_docs/2026-07-22_anchor分片验证指南.md``.
+# ---------------------------------------------------------------------------
+
+
+def shard_anchors(
+    anchor_positions: torch.Tensor,  # [global_num_anchors]
+    anchor_valid: torch.Tensor,  # [global_num_anchors]
+    group: ProcessGroup | None,
+    sp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Broadcast the sampled anchor set from SP-rank 0 (so every rank agrees on the
+    same global sample) and keep this rank's ``[sp_rank::sp_size]`` stride.
+
+    Identity when the group has a single rank, so ``sp_size == 1`` is unchanged.
+    ``global_num_anchors`` should be divisible by ``sp_size`` for an even split.
+    """
+    sp_size = _group_size(group)
+    if sp_size == 1:
+        return anchor_positions, anchor_valid
+    # All ranks sample independently; force agreement on rank 0's draw.
+    dist.broadcast(anchor_positions, src=dist.get_global_rank(group, 0), group=group)
+    dist.broadcast(anchor_valid, src=dist.get_global_rank(group, 0), group=group)
+    return anchor_positions[sp_rank::sp_size], anchor_valid[sp_rank::sp_size]
+
+
+def anchor_loss_scale(local_count: torch.Tensor, group: ProcessGroup | None) -> float:
+    """Constant factor to multiply the per-rank *mean* loss by so the world-averaged
+    gradient equals a single-rank run over all anchors.
+
+    DSpark's loss is ``sum(elementwise)/count`` (mean over valid positions). Under
+    anchor sharding each rank has a disjoint subset, so numerator and denominator
+    must be summed across the SP group before dividing. Keeping the existing global
+    DDP average, the correct per-rank scale is ``sp_size * local_count / total``
+    (backward_loss = loss * scale). At ``sp_size == 1`` this is exactly 1.0, so the
+    default path is unchanged.
+    """
+    sp_size = _group_size(group)
+    if sp_size == 1:
+        return 1.0
+    local = local_count.detach().float()
+    total = local.clone()
+    dist.all_reduce(total, op=dist.ReduceOp.SUM, group=group)
+    return float(sp_size) * (local / total.clamp(min=1.0)).item()

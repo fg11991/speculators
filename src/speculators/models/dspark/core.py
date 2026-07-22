@@ -129,7 +129,9 @@ class DSparkDraftModel(DFlashDraftModel):
         )
 
         # DSpark: add the Markov logit bias and predict per-position confidence.
-        num_blocks = max_anchors
+        # Derive the block count from the (possibly anchor-sharded) indices rather
+        # than max_anchors, so a rank that holds 1/sp of the anchors is sized right.
+        num_blocks = anchored_block_indices.shape[0] // self.block_size
         block = self.block_size
         mask_tokens_size = num_blocks * block
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
@@ -179,4 +181,15 @@ class DSparkDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
+
+        # Anchor sharding (sp_size>1): rescale the per-rank mean loss so the global
+        # DDP-averaged gradient equals a single-rank run over all anchors. No-op at
+        # sp_size==1 (scale == 1.0), so the default path is byte-identical.
+        from speculators.train.distributed import get_sp_group, get_sp_size  # noqa: PLC0415
+
+        if get_sp_size() > 1:
+            from speculators.train.sequence_parallel import anchor_loss_scale  # noqa: PLC0415
+
+            loss = loss * anchor_loss_scale(aligned_loss_mask.sum(), get_sp_group())
+
         return draft_tokens, loss, metrics
