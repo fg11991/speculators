@@ -462,8 +462,8 @@ def main(args: argparse.Namespace):  # noqa: C901
         loggers=args.logger, run_name=args.run_name, output_dir=args.log_dir
     )
 
-    # Setup distributed training
-    maybe_setup_distributed()
+    # Setup distributed training (sp_size=1 keeps the original single-sequence path)
+    maybe_setup_distributed(args.sp_size)
 
     if args.fsdp_shard and not is_distributed():
         raise ValueError(
@@ -1202,6 +1202,15 @@ def parse_args():
         "per-layer parameter all-gather stays on the fast intra-node fabric. "
         "Must divide world_size; requires --fsdp-shard. Default: shard "
         "across all ranks (ZeRO-3). Recommended on multi-node runs.",
+    )
+    parser.add_argument(
+        "--sp-size",
+        type=int,
+        default=1,
+        help="Ulysses sequence-parallel degree: split each sequence across this "
+        "many ranks to train longer context / more anchors at the same per-rank "
+        "memory. Must divide world_size. Default 1 (disabled; behavior unchanged). "
+        "Keep <= cards-per-node so the attention all-to-all stays intra-node.",
     )
 
     # lr scheduler
